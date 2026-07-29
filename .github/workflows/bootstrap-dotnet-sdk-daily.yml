@@ -1,0 +1,45 @@
+name: bootstrap-dotnet-sdk-daily
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bootstrap-dotnet-sdk-daily.yml'
+      - 'bootstrap-dotnet-sdk-daily-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download-official-daily-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Download official .NET 11 daily Linux x64 SDK and build metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          sdk_url='https://aka.ms/dotnet/11.0.1xx/daily/dotnet-sdk-linux-x64.tar.gz'
+          commit_url='https://aka.ms/dotnet/11.0.1xx/daily/productCommit-linux-x64.txt'
+          version_url='https://aka.ms/dotnet/11.0.1xx/daily/linux_x64_Release_version.txt'
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 30 \
+            --output out/dotnet-sdk-11-daily-linux-x64.tar.gz "$sdk_url"
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 30 \
+            --output out/productCommit-linux-x64.txt "$commit_url"
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 30 \
+            --output out/linux_x64_Release_version.txt "$version_url" || true
+          sha512sum out/dotnet-sdk-11-daily-linux-x64.tar.gz | tee out/dotnet-sdk.sha512
+          stat out/dotnet-sdk-11-daily-linux-x64.tar.gz | tee out/dotnet-sdk.stat.txt
+          printf '%s\n%s\n%s\n' "$sdk_url" "$commit_url" "$version_url" > out/source-urls.txt
+          cat out/productCommit-linux-x64.txt
+          cat out/linux_x64_Release_version.txt || true
+
+      - name: Upload official daily SDK archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-sdk-11-daily-linux-x64
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
