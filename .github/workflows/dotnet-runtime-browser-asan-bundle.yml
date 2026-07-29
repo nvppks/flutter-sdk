@@ -1,0 +1,140 @@
+name: dotnet-runtime-browser-asan-bundle
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/dotnet-runtime-browser-asan-bundle.yml'
+      - 'dotnet-runtime-browser-asan-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-browser-asan-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 260
+    steps:
+      - name: Reclaim disk and install native prerequisites
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -h
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libkrb5-dev libssl-dev zlib1g-dev libicu-dev libunwind-dev \
+            libcurl4-openssl-dev liblttng-ust-dev libnuma-dev uuid-dev
+          df -h
+
+      - name: Checkout exact dotnet/runtime revision
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: 6b6ef2eae64e3fad168738311a75ec5a11a09003
+          path: runtime
+          fetch-depth: 1
+
+      - name: Build generic Browser Mono runtime with ASan and package a clean sample
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:allocator_may_return_null=1
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/out/browser-asan"
+          mkdir -p "$OUT/appbundles"
+          cd "$GITHUB_WORKSPACE/runtime"
+          git rev-parse HEAD | tee "$OUT/runtime-commit.txt"
+          {
+            uname -a
+            nproc
+            free -h
+            df -h
+            clang --version | head -1
+            cmake --version | head -1
+            node --version
+          } | tee "$OUT/environment.txt"
+
+          timeout --signal=TERM --kill-after=2m 120m \
+            ./build.sh -os browser -subset mono+libs -c Debug 2>&1 \
+            | tee "$OUT/baseline-build.log"
+          BASELINE_RC=${PIPESTATUS[0]}
+          echo "$BASELINE_RC" > "$OUT/baseline-build.exitcode"
+
+          if [ "$BASELINE_RC" -eq 0 ]; then
+            timeout --signal=TERM --kill-after=2m 105m \
+              ./build.sh -os browser \
+                -subset mono.runtime+mono.wasmruntime+libs.pretest \
+                -c Debug -rebuild -fsanitize address \
+                /p:MonoEnableAssertMessages=true 2>&1 \
+              | tee "$OUT/asan-runtime-build.log"
+            ASAN_RC=${PIPESTATUS[0]}
+          else
+            ASAN_RC=125
+            echo "Skipped because baseline build failed" | tee "$OUT/asan-runtime-build.log"
+          fi
+          echo "$ASAN_RC" > "$OUT/asan-runtime-build.exitcode"
+
+          SAMPLE='src/mono/sample/wasm/console-v8/Wasm.Console.V8.Sample.csproj'
+          if [ "$ASAN_RC" -eq 0 ]; then
+            timeout --signal=TERM --kill-after=1m 35m \
+              ./dotnet.sh build /p:TargetOS=browser /p:Configuration=Debug \
+                "$SAMPLE" 2>&1 | tee "$OUT/sample-build.log"
+            SAMPLE_BUILD_RC=${PIPESTATUS[0]}
+          else
+            SAMPLE_BUILD_RC=125
+            echo "Skipped because ASan runtime build failed" | tee "$OUT/sample-build.log"
+          fi
+          echo "$SAMPLE_BUILD_RC" > "$OUT/sample-build.exitcode"
+
+          if [ "$SAMPLE_BUILD_RC" -eq 0 ]; then
+            timeout --signal=TERM --kill-after=30s 20m \
+              ./dotnet.sh build /p:TargetOS=browser /p:Configuration=Debug \
+                /t:RunSample "$SAMPLE" 2>&1 | tee "$OUT/sample-run.log"
+            SAMPLE_RUN_RC=${PIPESTATUS[0]}
+          else
+            SAMPLE_RUN_RC=125
+            echo "Skipped because sample build failed" | tee "$OUT/sample-run.log"
+          fi
+          echo "$SAMPLE_RUN_RC" > "$OUT/sample-run.exitcode"
+
+          find artifacts -type d -name AppBundle -print > "$OUT/appbundle-paths.txt" || true
+          i=0
+          while IFS= read -r bundle; do
+            [ -d "$bundle" ] || continue
+            i=$((i+1))
+            tar -C "$(dirname "$bundle")" -czf "$OUT/appbundles/appbundle-$i.tar.gz" "$(basename "$bundle")"
+            find "$bundle" -maxdepth 3 -type f -printf '%P\t%s\n' | sort \
+              > "$OUT/appbundles/appbundle-$i.inventory.txt"
+            sha256sum "$OUT/appbundles/appbundle-$i.tar.gz" \
+              > "$OUT/appbundles/appbundle-$i.tar.gz.sha256"
+          done < "$OUT/appbundle-paths.txt"
+
+          find artifacts/bin -maxdepth 6 -type f 2>/dev/null \
+            | grep -E '(browser-wasm|dotnet.native|mono)' \
+            | head -n 2000 > "$OUT/artifact-inventory.txt" || true
+          grep -E -i 'Address Sanitizer|AddressSanitizer|ERROR:|SUMMARY:|runtime error:' \
+            "$OUT"/*.log > "$OUT/sanitizer-markers.txt" || true
+
+          {
+            echo "runtime_commit=$(cat "$OUT/runtime-commit.txt")"
+            echo "baseline_build_exit=$(cat "$OUT/baseline-build.exitcode")"
+            echo "asan_runtime_build_exit=$(cat "$OUT/asan-runtime-build.exitcode")"
+            echo "sample_build_exit=$(cat "$OUT/sample-build.exitcode")"
+            echo "sample_run_exit=$(cat "$OUT/sample-run.exitcode")"
+            echo "asan_configured=$(grep -c 'Address Sanitizer (asan) enabled' "$OUT/asan-runtime-build.log" || true)"
+            echo "appbundle_count=$(find "$OUT/appbundles" -name 'appbundle-*.tar.gz' | wc -l)"
+            df -h
+          } | tee "$OUT/summary.txt"
+          exit 0
+
+      - name: Upload generic Browser ASan bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-runtime-browser-asan-bundle
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
