@@ -1,0 +1,171 @@
+name: dotnet-runtime-official-fuzzers
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/dotnet-runtime-official-fuzzers.yml'
+      - 'dotnet-runtime-official-fuzzers-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-official-fuzzers:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - name: Reclaim runner disk
+        shell: pwsh
+        run: |
+          Get-PSDrive C
+          $paths = @(
+            $env:ANDROID_HOME,
+            'C:\hostedtoolcache\windows\CodeQL',
+            'C:\Program Files\Android',
+            'C:\ghcup'
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          foreach ($path in $paths) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Get-PSDrive C
+
+      - name: Checkout exact dotnet/runtime revision
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: 6b6ef2eae64e3fad168738311a75ec5a11a09003
+          path: runtime
+          fetch-depth: 1
+
+      - name: Build, instrument, and run every prepared official fuzzer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'out\fuzz'
+          $crashOut = Join-Path $out 'crashes'
+          New-Item -ItemType Directory -Force -Path $out, $crashOut | Out-Null
+          Set-Location (Join-Path $env:GITHUB_WORKSPACE 'runtime')
+          git rev-parse HEAD | Tee-Object -FilePath (Join-Path $out 'runtime-commit.txt')
+          Get-PSDrive C | Out-File (Join-Path $out 'environment-before-build.txt')
+
+          cmd.exe /d /c ".\build.cmd -subset clr+libs -rc Release" 2>&1 |
+            Tee-Object -FilePath (Join-Path $out 'product-build.log')
+          $productRc = $LASTEXITCODE
+          Set-Content (Join-Path $out 'product-build.exitcode') $productRc
+
+          $toolRc = 125
+          $fuzzBuildRc = 125
+          $prepareRc = 125
+          if ($productRc -eq 0) {
+            .\.dotnet\dotnet.exe tool install SharpFuzz.CommandLine --tool-path .tools --version 2.2.0 2>&1 |
+              Tee-Object -FilePath (Join-Path $out 'sharpfuzz-install.log')
+            $toolRc = $LASTEXITCODE
+            $env:PATH = "$(Resolve-Path .tools);$env:PATH"
+
+            # Keep the official fuzzers unchanged. Only skip the final helper that edits
+            # an internal ADO deployment YAML after local fuzzer directories are ready.
+            $program = 'src\libraries\Fuzzing\DotnetFuzzing\Program.cs'
+            $programText = Get-Content $program -Raw
+            $needle = 'WorkaroundOneFuzzTaskNotAcceptingMultipleJobs(fuzzers);'
+            if (-not $programText.Contains($needle)) {
+              throw "OneFuzz workaround call not found in $program"
+            }
+            $programText = $programText.Replace(
+              $needle,
+              '// Generic local CI: deployment generated; skip internal ADO YAML rewrite.')
+            Set-Content -Path $program -Value $programText -Encoding utf8
+            git diff -- $program | Out-File (Join-Path $out 'harness-only.patch')
+
+            .\.dotnet\dotnet.exe build src\libraries\Fuzzing\DotnetFuzzing\DotnetFuzzing.csproj -c Debug 2>&1 |
+              Tee-Object -FilePath (Join-Path $out 'fuzzer-build.log')
+            $fuzzBuildRc = $LASTEXITCODE
+          }
+          Set-Content (Join-Path $out 'sharpfuzz-install.exitcode') $toolRc
+          Set-Content (Join-Path $out 'fuzzer-build.exitcode') $fuzzBuildRc
+
+          $exe = Get-ChildItem artifacts\bin\DotnetFuzzing -Filter DotnetFuzzing.exe -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          $deployment = Join-Path $env:GITHUB_WORKSPACE 'fuzz-deployment'
+          if ($fuzzBuildRc -eq 0 -and $null -ne $exe) {
+            & $exe.FullName prepare-onefuzz $deployment 2>&1 |
+              Tee-Object -FilePath (Join-Path $out 'prepare-onefuzz.log')
+            $prepareRc = $LASTEXITCODE
+          } else {
+            'Skipped: fuzzer executable was not built.' | Out-File (Join-Path $out 'prepare-onefuzz.log')
+          }
+          Set-Content (Join-Path $out 'prepare-onefuzz.exitcode') $prepareRc
+
+          $targets = @()
+          if ($prepareRc -eq 0 -and (Test-Path $deployment)) {
+            $targets = Get-ChildItem $deployment -Directory |
+              Where-Object { Test-Path (Join-Path $_.FullName 'libfuzzer-dotnet.exe') } |
+              Sort-Object Name
+          }
+          $targets.Name | Out-File (Join-Path $out 'prepared-targets.txt')
+          Set-Content (Join-Path $out 'prepared-target-count.txt') $targets.Count
+
+          foreach ($targetDirInfo in $targets) {
+            $target = $targetDirInfo.Name
+            $targetDir = $targetDirInfo.FullName
+            $log = Join-Path $out "$target.log"
+            $rcFile = Join-Path $out "$target.exitcode"
+            $workCorpus = Join-Path $targetDir 'work-corpus'
+            $crashes = Join-Path $targetDir 'crashes'
+            New-Item -ItemType Directory -Force -Path $workCorpus, $crashes | Out-Null
+            [IO.File]::WriteAllBytes((Join-Path $workCorpus 'seed'), [byte[]](0,1,2,3,4,5,6,7))
+
+            $args = @(
+              "--target_path=$(Join-Path $targetDir 'DotnetFuzzing.exe')",
+              "--target_arg=$target",
+              '-max_total_time=90',
+              '-timeout=20',
+              '-rss_limit_mb=4096',
+              '-print_final_stats=1',
+              "-artifact_prefix=$crashes\"
+            )
+            $dictionary = Join-Path $targetDir 'dictionary'
+            if (Test-Path $dictionary) { $args += "-dict=$dictionary" }
+            $args += $workCorpus
+            $seedCorpus = Join-Path $targetDir 'corpus'
+            if (Test-Path $seedCorpus) { $args += $seedCorpus }
+
+            & (Join-Path $targetDir 'libfuzzer-dotnet.exe') @args 2>&1 |
+              Tee-Object -FilePath $log
+            $rc = $LASTEXITCODE
+            Set-Content $rcFile $rc
+            Get-ChildItem $crashes -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName (Join-Path $crashOut ("$target-" + $_.Name)) -Force
+            }
+          }
+
+          Get-ChildItem $out -Filter '*.log' | ForEach-Object {
+            Select-String -Path $_.FullName -Pattern 'cov:|ft:|corp:|stat::|ERROR:|SUMMARY:|crash|deadly signal|AddressSanitizer' -CaseSensitive:$false
+          } | Out-File (Join-Path $out 'coverage-and-crash-markers.txt')
+
+          $targetSummaries = foreach ($targetDirInfo in $targets) {
+            $name = $targetDirInfo.Name
+            $rc = Get-Content (Join-Path $out "$name.exitcode")
+            $crashCount = (Get-ChildItem $crashOut -File -Filter "$name-*" -ErrorAction SilentlyContinue).Count
+            "${name}_exit=$rc crashes=$crashCount"
+          }
+          @(
+            "runtime_commit=$(Get-Content (Join-Path $out 'runtime-commit.txt'))",
+            "product_build_exit=$productRc",
+            "sharpfuzz_install_exit=$toolRc",
+            "fuzzer_build_exit=$fuzzBuildRc",
+            "prepare_exit=$prepareRc",
+            "prepared_targets=$($targets.Count)",
+            "total_crash_artifacts=$((Get-ChildItem $crashOut -File -ErrorAction SilentlyContinue).Count)"
+          ) + $targetSummaries | Out-File (Join-Path $out 'summary.txt')
+          Get-PSDrive C | Out-File (Join-Path $out 'environment-after.txt')
+          exit 0
+
+      - name: Upload exact official-fuzzer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-runtime-official-fuzzers-evidence
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
