@@ -1,0 +1,39 @@
+name: bootstrap-dotnet-sdk
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bootstrap-dotnet-sdk.yml'
+      - 'bootstrap-dotnet-sdk-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download-official-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download official .NET 11 preview 6 Linux x64 SDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          url='https://builds.dotnet.microsoft.com/dotnet/Sdk/11.0.100-preview.6.26359.118/dotnet-sdk-11.0.100-preview.6.26359.118-linux-x64.tar.gz'
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 30 \
+            --output out/dotnet-sdk-11.0.100-preview.6.26359.118-linux-x64.tar.gz "$url"
+          sha512sum out/dotnet-sdk-11.0.100-preview.6.26359.118-linux-x64.tar.gz \
+            | tee out/dotnet-sdk.sha512
+          stat out/dotnet-sdk-11.0.100-preview.6.26359.118-linux-x64.tar.gz \
+            | tee out/dotnet-sdk.stat.txt
+          printf '%s\n' "$url" > out/source-url.txt
+
+      - name: Upload official SDK archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-sdk-11-preview6-linux-x64
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
