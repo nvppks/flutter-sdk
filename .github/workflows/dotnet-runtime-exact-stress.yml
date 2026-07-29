@@ -1,0 +1,138 @@
+name: dotnet-runtime-exact-stress
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/dotnet-runtime-exact-stress.yml'
+      - 'dotnet-runtime-exact-stress-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checked-runtime-stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        campaign: [jit, loader, gc]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Reclaim disk and install native prerequisites
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -h
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libkrb5-dev libssl-dev zlib1g-dev libicu-dev libunwind-dev \
+            libcurl4-openssl-dev liblttng-ust-dev libnuma-dev uuid-dev
+          df -h
+
+      - name: Checkout exact dotnet/runtime revision
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: 6b6ef2eae64e3fad168738311a75ec5a11a09003
+          path: runtime
+          fetch-depth: 1
+
+      - name: Build Checked runtime and run stress campaign
+        shell: bash
+        env:
+          CAMPAIGN: ${{ matrix.campaign }}
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/out/stress-$CAMPAIGN"
+          REPORTS="$GITHUB_WORKSPACE/out/reports-$CAMPAIGN"
+          mkdir -p "$OUT" "$REPORTS"
+          cd "$GITHUB_WORKSPACE/runtime"
+          git rev-parse HEAD | tee "$OUT/runtime-commit.txt"
+          {
+            uname -a
+            nproc
+            free -h
+            df -h
+            echo "campaign=$CAMPAIGN"
+          } | tee "$OUT/environment.txt"
+
+          timeout --signal=TERM --kill-after=2m 110m \
+            ./build.sh -subset clr+libs -rc Checked -lc Release 2>&1 \
+            | tee "$OUT/product-build.log"
+          PRODUCT_RC=${PIPESTATUS[0]}
+          echo "$PRODUCT_RC" > "$OUT/product-build.exitcode"
+
+          case "$CAMPAIGN" in
+            jit)
+              TREE="JIT"
+              RUN_ARGS=(--jitstress=2 --jitstressregs=1 --tree=JIT)
+              ;;
+            loader)
+              TREE="Loader"
+              RUN_ARGS=(--jitstress=2 --jitforcerelocs --tree=Loader)
+              ;;
+            gc)
+              TREE="GC"
+              RUN_ARGS=(--gcstresslevel=0xC --tree=GC --sequential)
+              ;;
+          esac
+          echo "$TREE" > "$OUT/test-tree.txt"
+          printf '%q ' "${RUN_ARGS[@]}" > "$OUT/run-args.txt"
+          printf '\n' >> "$OUT/run-args.txt"
+
+          if [ "$PRODUCT_RC" -eq 0 ]; then
+            timeout --signal=TERM --kill-after=2m 105m \
+              ./src/tests/build.sh checked -tree:"$TREE" \
+                /p:LibrariesConfiguration=Release 2>&1 \
+              | tee "$OUT/test-build.log"
+            TEST_BUILD_RC=${PIPESTATUS[0]}
+          else
+            TEST_BUILD_RC=125
+            echo "Skipped because product build failed" | tee "$OUT/test-build.log"
+          fi
+          echo "$TEST_BUILD_RC" > "$OUT/test-build.exitcode"
+
+          if [ "$TEST_BUILD_RC" -eq 0 ]; then
+            ulimit -c 0
+            timeout --signal=TERM --kill-after=1m 95m \
+              ./src/tests/run.sh x64 checked "${RUN_ARGS[@]}" 2>&1 \
+              | tee "$OUT/stress-run.log"
+            RUN_RC=${PIPESTATUS[0]}
+          else
+            RUN_RC=125
+            echo "Skipped because test build failed" | tee "$OUT/stress-run.log"
+          fi
+          echo "$RUN_RC" > "$OUT/stress-run.exitcode"
+
+          find artifacts/log -type f \( -name '*.err' -o -name '*.html' -o -name '*.xml' \) \
+            -size -20M -print0 2>/dev/null \
+            | xargs -0 -r -I{} cp --parents '{}' "$REPORTS/"
+          find artifacts/tests/coreclr -type f \( -name '*.error.txt' -o -name '*.output.txt' \) \
+            -size -3M 2>/dev/null | head -n 1000 | while read -r f; do cp --parents "$f" "$REPORTS/"; done
+
+          grep -E -i '(^|[^0-9])(fail|error|crash|assert|segmentation|timeout)' \
+            "$OUT/product-build.log" "$OUT/test-build.log" "$OUT/stress-run.log" \
+            | tail -n 5000 > "$OUT/failure-markers.txt" || true
+          {
+            echo "campaign=$CAMPAIGN"
+            echo "runtime_commit=$(cat "$OUT/runtime-commit.txt")"
+            echo "product_build_exit=$(cat "$OUT/product-build.exitcode")"
+            echo "test_build_exit=$(cat "$OUT/test-build.exitcode")"
+            echo "stress_run_exit=$(cat "$OUT/stress-run.exitcode")"
+            echo "report_files=$(find "$REPORTS" -type f | wc -l)"
+            echo "error_files=$(find "$REPORTS" -type f -name '*.error.txt' | wc -l)"
+            df -h
+          } | tee "$OUT/summary.txt"
+          exit 0
+
+      - name: Upload exact stress evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-runtime-${{ matrix.campaign }}-stress-evidence
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
