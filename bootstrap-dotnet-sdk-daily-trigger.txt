@@ -1,0 +1,1 @@
+Download the current official .NET 11 daily Linux x64 SDK for local validation.
