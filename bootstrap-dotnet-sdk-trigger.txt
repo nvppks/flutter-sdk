@@ -1,0 +1,1 @@
+Download the official .NET 11 preview 6 Linux x64 SDK for local validation.
