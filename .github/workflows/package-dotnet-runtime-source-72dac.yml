@@ -1,0 +1,48 @@
+name: package-dotnet-runtime-source-72dac
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/package-dotnet-runtime-source-72dac.yml'
+      - 'package-dotnet-runtime-source-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install compressor
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd
+
+      - name: Checkout exact source revision
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: 72dac24a0e6fa1047002858a762f36c88e53850b
+          path: runtime
+          fetch-depth: 1
+
+      - name: Create deterministic source archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          cd runtime
+          git rev-parse HEAD | tee ../out/runtime-commit.txt
+          git archive --format=tar --prefix=dotnet-runtime-72dac/ HEAD | zstd -T0 -19 -o ../out/dotnet-runtime-72dac-source.tar.zst
+          cd ..
+          sha256sum out/dotnet-runtime-72dac-source.tar.zst > out/dotnet-runtime-72dac-source.tar.zst.sha256
+          stat -c '%n %s' out/dotnet-runtime-72dac-source.tar.zst | tee out/size.txt
+
+      - name: Upload exact source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-runtime-72dac-source
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
