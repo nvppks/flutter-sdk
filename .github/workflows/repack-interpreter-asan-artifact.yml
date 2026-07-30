@@ -1,0 +1,96 @@
+name: repack-interpreter-asan-artifact
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/repack-interpreter-asan-artifact.yml'
+      - 'repack-interpreter-asan-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  repack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Reclaim disk and install compression tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd
+          df -h
+
+      - name: Download completed interpreter artifact and repack
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARTIFACT_ID: '8752041975'
+        run: |
+          set -euxo pipefail
+          mkdir -p source extracted output
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" \
+            > source/source-artifact.zip
+          unzip -q source/source-artifact.zip -d source/unpacked
+          find source/unpacked -maxdepth 5 -type f -printf '%p\t%s\n' | sort > output/source-inventory.txt
+
+          archive=$(find source/unpacked -type f -name 'coreclr-linux-x64-checked-interpreter-asan.tar.gz' | head -1)
+          test -n "$archive"
+          tar -xzf "$archive" -C extracted
+          root=$(find extracted -type f -name corerun -printf '%h\n' | head -1)
+          test -n "$root"
+          echo "$root" > output/core-root.txt
+          find "$root" -maxdepth 2 -type f -printf '%P\t%s\n' | sort > output/full-core-root-inventory.txt
+
+          # Remove build/debug artifacts that corerun does not need. Keep all managed
+          # framework assemblies and runtime native shared libraries for compatibility.
+          find "$root" -type f \( \
+              -name '*.pdb' -o -name '*.dbg' -o -name '*.a' -o -name '*.lib' -o \
+              -name '*.map' -o -name '*.xml' -o -name '*.rsp' -o -name '*.ilk' \) -delete
+          find "$root" -type f -printf '%P\t%s\n' | sort > output/reduced-core-root-inventory.txt
+          du -sh "$root" | tee output/reduced-size.txt
+
+          tar -C "$(dirname "$root")" -cf - "$(basename "$root")" \
+            | zstd -T0 -19 -o output/coreclr-interpreter-asan-minimal.tar.zst
+          sha256sum output/coreclr-interpreter-asan-minimal.tar.zst \
+            > output/coreclr-interpreter-asan-minimal.tar.zst.sha256
+          stat -c '%n %s' output/coreclr-interpreter-asan-minimal.tar.zst \
+            | tee output/repacked-size.txt
+
+          # Split defensively so each artifact remains below the 512 MiB connector cap.
+          split -b 350M -d -a 2 output/coreclr-interpreter-asan-minimal.tar.zst \
+            output/coreclr-interpreter-asan-minimal.tar.zst.part-
+          sha256sum output/coreclr-interpreter-asan-minimal.tar.zst.part-* \
+            > output/parts.sha256
+          ls -l output/coreclr-interpreter-asan-minimal.tar.zst.part-* \
+            | tee output/parts.txt
+          cp source/unpacked/interpreter-asan/summary.txt output/original-summary.txt
+          cp source/unpacked/interpreter-asan/runtime-commit.txt output/original-runtime-commit.txt
+          df -h
+
+      - name: Upload metadata and first runtime part
+        uses: actions/upload-artifact@v4
+        with:
+          name: interpreter-asan-repacked-part-00
+          path: |
+            output/coreclr-interpreter-asan-minimal.tar.zst.part-00
+            output/*.txt
+            output/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload remaining runtime parts
+        uses: actions/upload-artifact@v4
+        with:
+          name: interpreter-asan-repacked-remaining-parts
+          path: output/coreclr-interpreter-asan-minimal.tar.zst.part-0[1-9]
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 7
