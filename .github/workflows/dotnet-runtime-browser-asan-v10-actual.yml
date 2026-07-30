@@ -1,0 +1,184 @@
+name: dotnet-runtime-browser-asan-v10-actual
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/dotnet-runtime-browser-asan-v10-actual.yml'
+      - 'dotnet-runtime-browser-asan-v10-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-mono-asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Reclaim disk and install native prerequisites
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -h
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libkrb5-dev libssl-dev zlib1g-dev libicu-dev libunwind-dev \
+            libcurl4-openssl-dev liblttng-ust-dev libnuma-dev uuid-dev
+          df -h
+
+      - name: Checkout supported dotnet/runtime release
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: v10.0.10
+          path: runtime
+          fetch-depth: 1
+
+      - name: Build actual Browser Mono runtime with AddressSanitizer and a Node sample
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:allocator_may_return_null=1
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/out/browser-asan-v10"
+          mkdir -p "$OUT/bundles"
+          cd "$GITHUB_WORKSPACE/runtime"
+          git rev-parse HEAD | tee "$OUT/runtime-commit.txt"
+          git describe --tags --always | tee "$OUT/runtime-ref.txt"
+          {
+            uname -a
+            nproc
+            free -h
+            df -h
+            clang --version | head -1
+            cmake --version | head -1
+            node --version
+          } | tee "$OUT/environment.txt"
+
+          timeout --signal=TERM --kill-after=2m 125m \
+            ./build.sh -os browser -subset mono+libs -c Debug 2>&1 \
+            | tee "$OUT/baseline-build.log"
+          BASELINE_RC=${PIPESTATUS[0]}
+          echo "$BASELINE_RC" > "$OUT/baseline-build.exitcode"
+
+          # EnableNativeSanitizers is not consumed by src/mono/mono.proj when it
+          # constructs the Mono CMake command. Pass CLR_CMAKE_ENABLE_SANITIZERS
+          # explicitly and remove the prior CMake object tree so configure cannot
+          # reuse the non-sanitized baseline cache.
+          if [ "$BASELINE_RC" -eq 0 ]; then
+            rm -rf artifacts/obj/mono/browser.wasm.Debug
+            timeout --signal=TERM --kill-after=2m 110m \
+              ./build.sh -os browser \
+                -subset mono.runtime+mono.wasmruntime+libs.pretest \
+                -c Debug -rebuild \
+                '/p:CMakeArgs=-DCLR_CMAKE_ENABLE_SANITIZERS=address' \
+                /p:EnableNativeSanitizers=address \
+                /p:MonoEnableAssertMessages=true 2>&1 \
+              | tee "$OUT/asan-runtime-build.log"
+            ASAN_RC=${PIPESTATUS[0]}
+          else
+            ASAN_RC=125
+            echo 'Skipped because baseline build failed' | tee "$OUT/asan-runtime-build.log"
+          fi
+          echo "$ASAN_RC" > "$OUT/asan-runtime-build.exitcode"
+
+          find artifacts/obj/mono -name CMakeCache.txt -print > "$OUT/cmake-cache-paths.txt" 2>/dev/null || true
+          while IFS= read -r cache; do
+            grep -H -E 'CLR_CMAKE_ENABLE_SANITIZERS|CMAKE_(C|CXX|EXE_LINKER)_FLAGS' "$cache" \
+              >> "$OUT/cmake-sanitizer-cache.txt" || true
+          done < "$OUT/cmake-cache-paths.txt"
+          grep -R -n -- '-fsanitize=address' artifacts/obj/mono/browser.wasm.Debug \
+            > "$OUT/native-fsanitize-flags.txt" 2>/dev/null || true
+
+          SAMPLE='src/mono/sample/wasm/console-node/Wasm.Console.Node.Sample.csproj'
+          if [ "$ASAN_RC" -eq 0 ]; then
+            timeout --signal=TERM --kill-after=1m 40m \
+              ./dotnet.sh build "$SAMPLE" -c Debug \
+                /p:TargetOS=browser /p:Configuration=Debug \
+                /p:EnableNativeSanitizers=address \
+                /p:WasmBuildNative=true 2>&1 \
+              | tee "$OUT/sample-build.log"
+            SAMPLE_BUILD_RC=${PIPESTATUS[0]}
+          else
+            SAMPLE_BUILD_RC=125
+            echo 'Skipped because ASan runtime build failed' | tee "$OUT/sample-build.log"
+          fi
+          echo "$SAMPLE_BUILD_RC" > "$OUT/sample-build.exitcode"
+
+          if [ "$SAMPLE_BUILD_RC" -eq 0 ]; then
+            timeout --signal=TERM --kill-after=30s 25m \
+              ./dotnet.sh build "$SAMPLE" -c Debug /t:RunSample \
+                /p:TargetOS=browser /p:Configuration=Debug \
+                /p:EnableNativeSanitizers=address \
+                /p:WasmBuildNative=true 2>&1 \
+              | tee "$OUT/sample-run.log"
+            SAMPLE_RUN_RC=${PIPESTATUS[0]}
+          else
+            SAMPLE_RUN_RC=125
+            echo 'Skipped because sample build failed' | tee "$OUT/sample-run.log"
+          fi
+          echo "$SAMPLE_RUN_RC" > "$OUT/sample-run.exitcode"
+
+          grep -E -n -- '-fsanitize=address|AddressSanitizer|__asan_' \
+            "$OUT/asan-runtime-build.log" "$OUT/sample-build.log" "$OUT/sample-run.log" \
+            > "$OUT/sanitizer-markers.txt" || true
+
+          find src/mono/sample/wasm/console-node -type d \( -name publish -o -name AppBundle \) \
+            -print > "$OUT/bundle-paths.txt" || true
+          i=0
+          while IFS= read -r bundle; do
+            [ -d "$bundle" ] || continue
+            i=$((i+1))
+            tar -C "$(dirname "$bundle")" -czf "$OUT/bundles/browser-node-$i.tar.gz" "$(basename "$bundle")"
+            find "$bundle" -maxdepth 5 -type f -printf '%P\t%s\n' | sort \
+              > "$OUT/bundles/browser-node-$i.inventory.txt"
+            sha256sum "$OUT/bundles/browser-node-$i.tar.gz" \
+              > "$OUT/bundles/browser-node-$i.tar.gz.sha256"
+            while IFS= read -r wasm; do
+              printf '%s\n' "===== $wasm =====" >> "$OUT/final-wasm-asan-symbols.txt"
+              grep -a -o -E '__asan_[A-Za-z0-9_]+' "$wasm" | sort -u | head -n 200 \
+                >> "$OUT/final-wasm-asan-symbols.txt" || true
+            done < <(find "$bundle" -type f -name '*.wasm')
+          done < "$OUT/bundle-paths.txt"
+
+          {
+            echo "runtime_commit=$(cat "$OUT/runtime-commit.txt")"
+            echo "runtime_ref=$(cat "$OUT/runtime-ref.txt")"
+            echo "baseline_build_exit=$(cat "$OUT/baseline-build.exitcode")"
+            echo "asan_runtime_build_exit=$(cat "$OUT/asan-runtime-build.exitcode")"
+            echo "sample_build_exit=$(cat "$OUT/sample-build.exitcode")"
+            echo "sample_run_exit=$(cat "$OUT/sample-run.exitcode")"
+            echo "cmake_asan_entries=$(grep -c 'CLR_CMAKE_ENABLE_SANITIZERS.*address' "$OUT/cmake-sanitizer-cache.txt" 2>/dev/null || true)"
+            echo "native_fsanitize_flags=$(wc -l < "$OUT/native-fsanitize-flags.txt" 2>/dev/null || echo 0)"
+            echo "sample_link_fsanitize_flags=$(grep -c -- '-fsanitize=address' "$OUT/sample-build.log" 2>/dev/null || true)"
+            echo "final_wasm_asan_symbols=$(grep -c '__asan_' "$OUT/final-wasm-asan-symbols.txt" 2>/dev/null || true)"
+            echo "bundle_count=$(find "$OUT/bundles" -name 'browser-node-*.tar.gz' | wc -l)"
+            df -h
+          } | tee "$OUT/summary.txt"
+          exit 0
+
+      - name: Upload Browser Mono ASan bundle and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-runtime-v10-browser-asan-actual
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Enforce actual sanitizer and sample execution gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/out/browser-asan-v10"
+          test "$(cat "$OUT/baseline-build.exitcode")" = 0
+          test "$(cat "$OUT/asan-runtime-build.exitcode")" = 0
+          test "$(cat "$OUT/sample-build.exitcode")" = 0
+          test "$(cat "$OUT/sample-run.exitcode")" = 0
+          grep -q 'CLR_CMAKE_ENABLE_SANITIZERS.*address' "$OUT/cmake-sanitizer-cache.txt"
+          test -s "$OUT/native-fsanitize-flags.txt"
+          grep -q -- '-fsanitize=address' "$OUT/sample-build.log"
+          test "$(find "$OUT/bundles" -name 'browser-node-*.tar.gz' | wc -l)" -gt 0
