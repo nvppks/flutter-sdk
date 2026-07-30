@@ -1,0 +1,50 @@
+name: extract-interpreter-debug-symbols
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/extract-interpreter-debug-symbols.yml'
+      - 'extract-interpreter-debug-symbols-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download completed exact pre-fix artifact and extract symbols
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARTIFACT_ID: '8752041975'
+        run: |
+          set -euxo pipefail
+          mkdir -p source out
+          gh api -H 'Accept: application/vnd.github+json' \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" \
+            > source/source.zip
+          unzip -q source/source.zip -d source/unpacked
+          find source/unpacked -type f -name 'coreclr-linux-x64-checked-interpreter-asan.tar.gz' -print -quit > source/archive-path.txt
+          archive=$(cat source/archive-path.txt)
+          test -n "$archive"
+          mkdir -p source/runtime
+          tar -xzf "$archive" -C source/runtime
+          find source/runtime -type f \( -name 'libclrinterpreter.so' -o -name 'libclrinterpreter.so.dbg' \) -print -exec cp -a {} out/ \;
+          test -s out/libclrinterpreter.so
+          test -s out/libclrinterpreter.so.dbg
+          readelf -n out/libclrinterpreter.so | grep 'Build ID' | tee out/build-id.txt
+          file out/libclrinterpreter.so out/libclrinterpreter.so.dbg | tee out/file.txt
+          sha256sum out/* > out/sha256.txt
+
+      - name: Upload exact interpreter symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-prefixed-interpreter-debug-symbols
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

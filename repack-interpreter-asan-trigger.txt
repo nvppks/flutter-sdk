@@ -1,0 +1,3 @@
+trigger: 2026-07-30T15:02:00+07:00
+source_artifact_id: 8752041975
+purpose: repack exact pre-fix CoreCLR interpreter ASan runtime below connector limit
