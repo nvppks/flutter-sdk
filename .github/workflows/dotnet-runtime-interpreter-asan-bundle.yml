@@ -1,0 +1,133 @@
+name: dotnet-runtime-interpreter-asan-bundle
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/dotnet-runtime-interpreter-asan-bundle.yml'
+      - 'dotnet-runtime-interpreter-asan-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-interpreter-asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Reclaim disk and install native prerequisites
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -h
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libkrb5-dev libssl-dev zlib1g-dev libicu-dev libunwind-dev \
+            libcurl4-openssl-dev liblttng-ust-dev libnuma-dev uuid-dev
+          df -h
+
+      - name: Checkout exact pre-fix dotnet/runtime revision
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: 7a6987d6e1ca353163a8684054b71693c9db8fc6
+          path: runtime
+          fetch-depth: 1
+
+      - name: Build Checked CoreCLR with interpreter and AddressSanitizer
+        shell: bash
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/out/interpreter-asan"
+          mkdir -p "$OUT/runtime"
+          cd "$GITHUB_WORKSPACE/runtime"
+          git rev-parse HEAD | tee "$OUT/runtime-commit.txt"
+          {
+            uname -a
+            nproc
+            free -h
+            df -h
+            clang --version | head -1
+            cmake --version | head -1
+          } | tee "$OUT/environment.txt"
+
+          timeout --signal=TERM --kill-after=2m 165m \
+            ./build.sh -subset clr+libs -rc Checked -lc Release \
+              -clrinterpreter -fsanitize address 2>&1 \
+            | tee "$OUT/build.log"
+          BUILD_RC=${PIPESTATUS[0]}
+          echo "$BUILD_RC" > "$OUT/build.exitcode"
+
+          CORE_ROOT='artifacts/bin/coreclr/linux.x64.Checked'
+          echo "$CORE_ROOT" > "$OUT/core-root-relative.txt"
+          find artifacts/obj/coreclr -name CMakeCache.txt -print \
+            > "$OUT/cmake-cache-paths.txt" 2>/dev/null || true
+          while IFS= read -r cache; do
+            grep -H -E 'CLR_CMAKE_ENABLE_SANITIZERS|FEATURE_INTERPRETER|CMAKE_(C|CXX|EXE|SHARED)_LINKER_FLAGS' "$cache" \
+              >> "$OUT/cmake-feature-sanitizer.txt" || true
+          done < "$OUT/cmake-cache-paths.txt"
+          grep -R -n -E 'FEATURE_INTERPRETER|CLR_CMAKE_ENABLE_SANITIZERS' \
+            artifacts/obj/coreclr artifacts/obj/_version.c 2>/dev/null \
+            | head -n 2000 > "$OUT/generated-feature-markers.txt" || true
+
+          if [ -f "$CORE_ROOT/libcoreclr.so" ]; then
+            ldd "$CORE_ROOT/libcoreclr.so" > "$OUT/libcoreclr.ldd.txt" 2>&1 || true
+            strings "$CORE_ROOT/libcoreclr.so" \
+              | grep -E 'InterpMode|InterpreterName|Interpreter|AddressSanitizer|__asan_' \
+              | head -n 1000 > "$OUT/libcoreclr.interpreter-asan-strings.txt" || true
+          fi
+          if [ -f "$CORE_ROOT/corerun" ]; then
+            ldd "$CORE_ROOT/corerun" > "$OUT/corerun.ldd.txt" 2>&1 || true
+          fi
+          grep -R -n -- '-fsanitize=address' artifacts/obj/coreclr \
+            > "$OUT/native-fsanitize-flags.txt" 2>/dev/null || true
+
+          if [ "$BUILD_RC" -eq 0 ] && [ -d "$CORE_ROOT" ]; then
+            tar -C "$(dirname "$CORE_ROOT")" -czf "$OUT/runtime/coreclr-linux-x64-checked-interpreter-asan.tar.gz" \
+              "$(basename "$CORE_ROOT")"
+            sha256sum "$OUT/runtime/coreclr-linux-x64-checked-interpreter-asan.tar.gz" \
+              > "$OUT/runtime/coreclr-linux-x64-checked-interpreter-asan.tar.gz.sha256"
+            find "$CORE_ROOT" -maxdepth 2 -type f -printf '%P\t%s\n' | sort \
+              > "$OUT/runtime/coreclr.inventory.txt"
+          fi
+
+          {
+            echo "runtime_commit=$(cat "$OUT/runtime-commit.txt")"
+            echo "build_exit=$(cat "$OUT/build.exitcode")"
+            echo "corerun_present=$([ -x "$CORE_ROOT/corerun" ] && echo 1 || echo 0)"
+            echo "coreclr_present=$([ -f "$CORE_ROOT/libcoreclr.so" ] && echo 1 || echo 0)"
+            echo "corelib_present=$([ -f "$CORE_ROOT/System.Private.CoreLib.dll" ] && echo 1 || echo 0)"
+            echo "cmake_asan_entries=$(grep -c 'CLR_CMAKE_ENABLE_SANITIZERS.*address' "$OUT/cmake-feature-sanitizer.txt" 2>/dev/null || true)"
+            echo "feature_interpreter_entries=$(grep -c 'FEATURE_INTERPRETER' "$OUT/generated-feature-markers.txt" 2>/dev/null || true)"
+            echo "fsanitize_flag_lines=$(wc -l < "$OUT/native-fsanitize-flags.txt" 2>/dev/null || echo 0)"
+            echo "asan_dynamic_dependency=$(grep -Ec 'asan|clang_rt' "$OUT/libcoreclr.ldd.txt" 2>/dev/null || true)"
+            echo "archive_count=$(find "$OUT/runtime" -name '*.tar.gz' | wc -l)"
+            df -h
+          } | tee "$OUT/summary.txt"
+          exit 0
+
+      - name: Upload interpreter ASan runtime bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-runtime-interpreter-asan-bundle
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Enforce interpreter and sanitizer build gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/out/interpreter-asan"
+          test "$(cat "$OUT/build.exitcode")" = 0
+          grep -q 'runtime_commit=7a6987d6e1ca353163a8684054b71693c9db8fc6' "$OUT/summary.txt"
+          grep -q 'corerun_present=1' "$OUT/summary.txt"
+          grep -q 'coreclr_present=1' "$OUT/summary.txt"
+          grep -q 'corelib_present=1' "$OUT/summary.txt"
+          grep -q 'CLR_CMAKE_ENABLE_SANITIZERS.*address' "$OUT/cmake-feature-sanitizer.txt"
+          test -s "$OUT/native-fsanitize-flags.txt"
+          test -s "$OUT/runtime/coreclr-linux-x64-checked-interpreter-asan.tar.gz"
