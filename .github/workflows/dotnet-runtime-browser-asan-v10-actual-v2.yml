@@ -1,17 +1,18 @@
-name: dotnet-runtime-browser-asan-v10-actual-v2
+name: dotnet-runtime-browser-asan-v10-postconfigure-v3
 
 on:
   pull_request:
     paths:
       - '.github/workflows/dotnet-runtime-browser-asan-v10-actual-v2.yml'
       - 'dotnet-runtime-browser-asan-v10-trigger-v2.txt'
+      - 'dotnet-runtime-browser-asan-v10-trigger-v3.txt'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  browser-mono-asan-v2:
+  browser-mono-asan-postconfigure:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -32,55 +33,65 @@ jobs:
           path: runtime
           fetch-depth: 1
 
-      - name: Build truly instrumented Browser Mono and run clean Node sample
+      - name: Build Browser Mono with post-configure ASan flags and run clean Node sample
         shell: bash
         env:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:allocator_may_return_null=1
         run: |
           set +e
-          OUT="$GITHUB_WORKSPACE/out/browser-asan-v10-v2"
+          OUT="$GITHUB_WORKSPACE/out/browser-asan-v10-postconfigure"
           mkdir -p "$OUT/bundle"
           cd "$GITHUB_WORKSPACE/runtime"
           git rev-parse HEAD | tee "$OUT/runtime-commit.txt"
           git describe --tags --always | tee "$OUT/runtime-ref.txt"
           node --version | tee "$OUT/node-version.txt"
 
-          timeout --signal=TERM --kill-after=2m 125m ./build.sh -os browser -subset mono+libs -c Debug 2>&1 | tee "$OUT/baseline-build.log"
-          BASE_RC=${PIPESTATUS[0]}
-          echo "$BASE_RC" > "$OUT/baseline-build.exitcode"
-
-          # mono.proj always emits its own CMAKE_C_FLAGS/CMAKE_CXX_FLAGS after CMakeArgs.
-          # Add a validation-only item group so the actual runtime archives are compiled
-          # with ASan instead of merely leaving an unused CMake cache variable behind.
+          # Global CMAKE_C_FLAGS made Emscripten feature probes fail. Insert
+          # sanitizer options only after Mono's include(configure) has completed,
+          # so product targets are instrumented but CMake capability tests remain clean.
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('src/mono/mono.proj')
+          p = Path('src/mono/CMakeLists.txt')
           s = p.read_text(encoding='utf-8')
-          marker = '  <Target Name="BuildMonoRuntime">\n'
-          insert = '''  <Target Name="BuildMonoRuntime">\n    <ItemGroup Condition="\'$(TargetsBrowser)\' == \'true\' and \'$(SecurityValidationAsan)\' == \'true\'">\n      <_MonoCFLAGS Include="-fsanitize=address" />\n      <_MonoCXXFLAGS Include="-fsanitize=address" />\n    </ItemGroup>\n'''
-          if marker not in s:
-              raise SystemExit('BuildMonoRuntime marker missing')
+          marker = 'include(configure)\n'
+          insert = '''include(configure)
+
+if(SECURITY_VALIDATION_ASAN)
+  add_compile_options(-fsanitize=address)
+  add_link_options(-fsanitize=address)
+endif()
+'''
+          if s.count(marker) != 1:
+              raise SystemExit(f'expected one configure marker, found {s.count(marker)}')
           p.write_text(s.replace(marker, insert, 1), encoding='utf-8')
           PY
-          git diff -- src/mono/mono.proj | tee "$OUT/build-infrastructure.patch"
+          git diff -- src/mono/CMakeLists.txt | tee "$OUT/build-infrastructure.patch"
 
-          if [ "$BASE_RC" -eq 0 ]; then
-            rm -rf artifacts/obj/mono/browser.wasm.Debug
-            timeout --signal=TERM --kill-after=2m 115m ./build.sh -os browser -subset mono.runtime+mono.wasmruntime+libs.pretest -c Debug -rebuild /p:SecurityValidationAsan=true /p:MonoEnableAssertMessages=true 2>&1 | tee "$OUT/asan-runtime-build.log"
-            ASAN_RC=${PIPESTATUS[0]}
-          else
-            ASAN_RC=125
-            echo skipped | tee "$OUT/asan-runtime-build.log"
-          fi
+          timeout --signal=TERM --kill-after=2m 190m \
+            ./build.sh -os browser -subset mono+libs -c Debug \
+              '/p:CMakeArgs=-DSECURITY_VALIDATION_ASAN=1' \
+              /p:MonoEnableAssertMessages=true 2>&1 | tee "$OUT/asan-runtime-build.log"
+          ASAN_RC=${PIPESTATUS[0]}
           echo "$ASAN_RC" > "$OUT/asan-runtime-build.exitcode"
 
-          grep -R -n -- '-fsanitize=address' artifacts/obj/mono/browser.wasm.Debug > "$OUT/runtime-fsanitize-flags.txt" 2>/dev/null || true
-          grep -R -n -- '-fsanitize=address' artifacts/obj/mono/browser.wasm.Debug/compile_commands.json > "$OUT/runtime-compile-commands-asan.txt" 2>/dev/null || true
+          find artifacts/obj/mono -name CMakeCache.txt -print > "$OUT/cmake-cache-paths.txt" 2>/dev/null || true
+          find artifacts/obj/mono/browser.wasm.Debug -name compile_commands.json -print > "$OUT/compile-command-paths.txt" 2>/dev/null || true
+          grep -R -n -- '-fsanitize=address' artifacts/obj/mono/browser.wasm.Debug \
+            > "$OUT/runtime-fsanitize-flags.txt" 2>/dev/null || true
+          while IFS= read -r commands; do
+            grep -H -n -- '-fsanitize=address' "$commands" >> "$OUT/runtime-compile-commands-asan.txt" || true
+          done < "$OUT/compile-command-paths.txt"
 
           SAMPLE='src/mono/sample/wasm/console-node/Wasm.Console.Node.Sample.csproj'
           if [ "$ASAN_RC" -eq 0 ]; then
             rm -rf src/mono/sample/wasm/console-node/bin artifacts/obj/mono/Wasm.Console.Node.Sample
-            timeout --signal=TERM --kill-after=1m 50m ./dotnet.sh build "$SAMPLE" -c Debug /p:TargetOS=browser /p:Configuration=Debug /p:WasmBuildNative=true /p:WasmNativeStrip=false /p:EmccVerbose=true /p:EmccExtraCFlags=-fsanitize=address /p:EmccExtraLDFlags=-fsanitize=address 2>&1 | tee "$OUT/sample-build.log"
+            timeout --signal=TERM --kill-after=1m 70m \
+              ./dotnet.sh build "$SAMPLE" -c Debug \
+                /p:TargetOS=browser /p:Configuration=Debug \
+                /p:WasmBuildNative=true /p:WasmNativeStrip=false \
+                /p:EmccVerbose=true \
+                /p:EmccExtraCFlags=-fsanitize=address \
+                /p:EmccExtraLDFlags=-fsanitize=address 2>&1 | tee "$OUT/sample-build.log"
             SAMPLE_RC=${PIPESTATUS[0]}
           else
             SAMPLE_RC=125
@@ -111,7 +122,6 @@ jobs:
           {
             echo "runtime_commit=$(cat "$OUT/runtime-commit.txt")"
             echo "runtime_ref=$(cat "$OUT/runtime-ref.txt")"
-            echo "baseline_exit=$BASE_RC"
             echo "asan_runtime_exit=$ASAN_RC"
             echo "sample_build_exit=$SAMPLE_RC"
             echo "sample_run_exit=$RUN_RC"
@@ -122,22 +132,21 @@ jobs:
           } | tee "$OUT/summary.txt"
           exit 0
 
-      - name: Upload actual ASan evidence
+      - name: Upload post-configure ASan evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dotnet-runtime-v10-browser-asan-actual-v2
+          name: dotnet-runtime-v10-browser-asan-postconfigure-v3
           path: out/
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
 
-      - name: Enforce actual instrumentation and execution
+      - name: Enforce product instrumentation and clean execution
         shell: bash
         run: |
           set -euo pipefail
-          OUT="$GITHUB_WORKSPACE/out/browser-asan-v10-v2"
-          test "$(cat "$OUT/baseline-build.exitcode")" = 0
+          OUT="$GITHUB_WORKSPACE/out/browser-asan-v10-postconfigure"
           test "$(cat "$OUT/asan-runtime-build.exitcode")" = 0
           test "$(cat "$OUT/sample-build.exitcode")" = 0
           test "$(cat "$OUT/sample-run.exitcode")" = 3
