@@ -1,0 +1,151 @@
+name: dotnet-runtime-browser-asan-v10-postconfigure
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/dotnet-runtime-browser-asan-v10-actual.yml'
+      - 'dotnet-runtime-browser-asan-v10-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-mono-asan-postconfigure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Reclaim disk and install prerequisites
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libkrb5-dev libssl-dev zlib1g-dev libicu-dev libunwind-dev libcurl4-openssl-dev liblttng-ust-dev libnuma-dev uuid-dev
+
+      - name: Checkout supported runtime
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: v10.0.10
+          path: runtime
+          fetch-depth: 1
+
+      - name: Build instrumented Browser Mono and clean Node sample
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:allocator_may_return_null=1
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/out/browser-asan-v10-postconfigure"
+          mkdir -p "$OUT/bundle"
+          cd "$GITHUB_WORKSPACE/runtime"
+          git rev-parse HEAD | tee "$OUT/runtime-commit.txt"
+          git describe --tags --always | tee "$OUT/runtime-ref.txt"
+          node --version | tee "$OUT/node-version.txt"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/mono/CMakeLists.txt')
+          s = p.read_text(encoding='utf-8')
+          marker = 'include(configure)\n'
+          insert = '''include(configure)
+
+if(SECURITY_VALIDATION_ASAN)
+  add_compile_options(-fsanitize=address)
+  add_link_options(-fsanitize=address)
+endif()
+'''
+          if s.count(marker) != 1:
+              raise SystemExit(f'expected one configure marker, found {s.count(marker)}')
+          p.write_text(s.replace(marker, insert, 1), encoding='utf-8')
+          PY
+          git diff -- src/mono/CMakeLists.txt | tee "$OUT/build-infrastructure.patch"
+
+          timeout --signal=TERM --kill-after=2m 190m \
+            ./build.sh -os browser -subset mono+libs -c Debug \
+              '/p:CMakeArgs=-DSECURITY_VALIDATION_ASAN=1' \
+              /p:MonoEnableAssertMessages=true 2>&1 | tee "$OUT/asan-runtime-build.log"
+          ASAN_RC=${PIPESTATUS[0]}
+          echo "$ASAN_RC" > "$OUT/asan-runtime-build.exitcode"
+
+          find artifacts/obj/mono/browser.wasm.Debug -name compile_commands.json -print > "$OUT/compile-command-paths.txt" 2>/dev/null || true
+          while IFS= read -r commands; do
+            grep -H -n -- '-fsanitize=address' "$commands" >> "$OUT/runtime-compile-commands-asan.txt" || true
+          done < "$OUT/compile-command-paths.txt"
+          grep -R -n -- '-fsanitize=address' artifacts/obj/mono/browser.wasm.Debug > "$OUT/runtime-fsanitize-flags.txt" 2>/dev/null || true
+
+          SAMPLE='src/mono/sample/wasm/console-node/Wasm.Console.Node.Sample.csproj'
+          if [ "$ASAN_RC" -eq 0 ]; then
+            rm -rf src/mono/sample/wasm/console-node/bin artifacts/obj/mono/Wasm.Console.Node.Sample
+            timeout --signal=TERM --kill-after=1m 70m \
+              ./dotnet.sh build "$SAMPLE" -c Debug \
+                /p:TargetOS=browser /p:Configuration=Debug \
+                /p:WasmBuildNative=true /p:WasmNativeStrip=false \
+                /p:EmccVerbose=true \
+                /p:EmccExtraCFlags=-fsanitize=address \
+                /p:EmccExtraLDFlags=-fsanitize=address 2>&1 | tee "$OUT/sample-build.log"
+            SAMPLE_RC=${PIPESTATUS[0]}
+          else
+            SAMPLE_RC=125
+            echo skipped | tee "$OUT/sample-build.log"
+          fi
+          echo "$SAMPLE_RC" > "$OUT/sample-build.exitcode"
+
+          APP='src/mono/sample/wasm/console-node/bin/Debug/AppBundle'
+          if [ "$SAMPLE_RC" -eq 0 ] && [ -f "$APP/main.mjs" ]; then
+            cp -a "$APP/." "$OUT/bundle/"
+            (cd "$APP" && timeout --signal=TERM --kill-after=10s 90s node main.mjs) 2>&1 | tee "$OUT/sample-run.log"
+            RUN_RC=${PIPESTATUS[0]}
+          else
+            RUN_RC=125
+            echo skipped | tee "$OUT/sample-run.log"
+          fi
+          echo "$RUN_RC" > "$OUT/sample-run.exitcode"
+
+          grep -n -- '-fsanitize=address' "$OUT/sample-build.log" > "$OUT/sample-fsanitize-flags.txt" || true
+          find "$APP" -type f -name '*.wasm' -print > "$OUT/final-wasm-files.txt" 2>/dev/null || true
+          while IFS= read -r wasm; do
+            echo "===== $wasm =====" >> "$OUT/final-wasm-asan-symbols.txt"
+            grep -a -o -E '__asan_[A-Za-z0-9_]+' "$wasm" | sort -u | head -n 500 >> "$OUT/final-wasm-asan-symbols.txt" || true
+          done < "$OUT/final-wasm-files.txt"
+          tar -C "$OUT" -czf "$OUT/browser-node-v10-asan-appbundle.tar.gz" bundle
+          sha256sum "$OUT/browser-node-v10-asan-appbundle.tar.gz" > "$OUT/browser-node-v10-asan-appbundle.tar.gz.sha256"
+
+          {
+            echo "runtime_commit=$(cat "$OUT/runtime-commit.txt")"
+            echo "runtime_ref=$(cat "$OUT/runtime-ref.txt")"
+            echo "asan_runtime_exit=$ASAN_RC"
+            echo "sample_build_exit=$SAMPLE_RC"
+            echo "sample_run_exit=$RUN_RC"
+            echo "runtime_flag_lines=$(wc -l < "$OUT/runtime-compile-commands-asan.txt" 2>/dev/null || echo 0)"
+            echo "sample_flag_lines=$(wc -l < "$OUT/sample-fsanitize-flags.txt" 2>/dev/null || echo 0)"
+            echo "final_asan_symbols=$(grep -c '__asan_' "$OUT/final-wasm-asan-symbols.txt" 2>/dev/null || true)"
+            echo "bundle_files=$(find "$OUT/bundle" -type f | wc -l)"
+          } | tee "$OUT/summary.txt"
+          exit 0
+
+      - name: Upload post-configure ASan evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-runtime-v10-browser-asan-postconfigure
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Enforce instrumentation and clean execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/out/browser-asan-v10-postconfigure"
+          test "$(cat "$OUT/asan-runtime-build.exitcode")" = 0
+          test "$(cat "$OUT/sample-build.exitcode")" = 0
+          test "$(cat "$OUT/sample-run.exitcode")" = 3
+          test -s "$OUT/runtime-compile-commands-asan.txt"
+          test -s "$OUT/sample-fsanitize-flags.txt"
+          grep -q '__asan_' "$OUT/final-wasm-asan-symbols.txt"
+          grep -q 'Hello World!' "$OUT/sample-run.log"
+          test -s "$OUT/browser-node-v10-asan-appbundle.tar.gz"
